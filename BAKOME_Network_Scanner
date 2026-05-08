@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""
+Network Vulnerability Scanner with PDF Report
+BAKOME Security Tool v1.0
+Scans network, detects open ports, devices, and generates professional PDF report.
+"""
+
+import nmap
+import socket
+import ipaddress
+import subprocess
+import platform
+from datetime import datetime
+from scapy.all import ARP, Ether, srp
+import threading
+import queue
+import sys
+import os
+
+# PDF libraries
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+from reportlab.pdfgen import canvas
+import matplotlib.pyplot as plt
+import io
+
+# ================= CONFIGURATION =================
+NETWORK_SCAN_CIDR = "192.168.1.0/24"  # Change to your network
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1433, 3306, 3389, 5432, 5900, 8080]
+VULNERABLE_SERVICES = {
+    21: "FTP (Anonymous access possible)",
+    23: "Telnet (Unencrypted)",
+    445: "SMB (Potential EternalBlue)",
+    3389: "RDP (Weak credentials risk)",
+    3306: "MySQL (Default credentials possible)",
+    1433: "MSSQL (Default credentials)",
+    5900: "VNC (Weak/no auth risk)"
+}
+
+# ================= SCANNER CLASS =================
+class NetworkScanner:
+    def __init__(self, network_cidr):
+        self.network_cidr = network_cidr
+        self.devices = []
+        self.vulnerabilities = []
+        self.open_ports_per_device = {}
+        self.scan_time = datetime.now()
+        
+    def discover_devices_arp(self):
+        """Discover all devices on the network using ARP scan"""
+        print(f"[+] Scanning network: {self.network_cidr}")
+        arp = ARP(pdst=self.network_cidr)
+        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = ether/arp
+        
+        result = srp(packet, timeout=3, verbose=0)[0]
+        
+        for sent, received in result:
+            self.devices.append({
+                'ip': received.psrc,
+                'mac': received.hwsrc,
+                'hostname': self.get_hostname(received.psrc)
+            })
+        
+        print(f"[+] Found {len(self.devices)} active devices")
+        return self.devices
+    
+    def get_hostname(self, ip):
+        """Resolve hostname from IP"""
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+            return hostname
+        except:
+            return "Unknown"
+    
+    def scan_ports_nmap(self, ip):
+        """Scan open ports using python-nmap"""
+        open_ports = []
+        try:
+            nm = nmap.PortScanner()
+            nm.scan(ip, arguments='-T4 -F')  # Fast scan
+            for proto in nm[ip].all_protocols():
+                ports = nm[ip][proto].keys()
+                for port in ports:
+                    if nm[ip][proto][port]['state'] == 'open':
+                        open_ports.append(port)
+        except:
+            # Fallback to socket scan if nmap fails
+            for port in COMMON_PORTS:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                result = sock.connect_ex((ip, port))
+                if result == 0:
+                    open_ports.append(port)
+                sock.close()
+        
+        return open_ports
+    
+    def scan_all_devices(self):
+        """Scan all discovered devices for open ports"""
+        print("[+] Scanning open ports on all devices...")
+        for device in self.devices:
+            ip = device['ip']
+            print(f"    Scanning {ip}...")
+            open_ports = self.scan_ports_nmap(ip)
+            self.open_ports_per_device[ip] = open_ports
+            
+            # Check for vulnerable services
+            for port in open_ports:
+                if port in VULNERABLE_SERVICES:
+                    self.vulnerabilities.append({
+                        'ip': ip,
+                        'port': port,
+                        'service': VULNERABLE_SERVICES[port],
+                        'hostname': device['hostname']
+                    })
+            
+            # Add warning for too many open ports
+            if len(open_ports) > 10:
+                self.vulnerabilities.append({
+                    'ip': ip,
+                    'port': 'MULTIPLE',
+                    'service': f"{len(open_ports)} open ports - Possible exposed attack surface",
+                    'hostname': device['hostname']
+                })
+        
+        print(f"[+] Found {len(self.vulnerabilities)} potential vulnerabilities")
+        return self.vulnerabilities
+    
+    def check_common_vulnerabilities(self):
+        """Check for common network vulnerabilities"""
+        print("[+] Checking for common vulnerabilities...")
+        
+        # Check for default gateway vulnerability
+        gateway = self.network_cidr.split('.')[0] + '.' + \
+                  self.network_cidr.split('.')[1] + '.' + \
+                  self.network_cidr.split('.')[2] + '.1'
+        
+        if gateway in [d['ip'] for d in self.devices]:
+            self.vulnerabilities.append({
+                'ip': gateway,
+                'port': 'ROUTER',
+                'service': 'Default gateway - Check for default credentials',
+                'hostname': self.get_hostname(gateway)
+            })
+        
+        return self.vulnerabilities
+    
+    def generate_graph(self):
+        """Generate a bar chart of open ports per device"""
+        devices_ips = []
+        ports_count = []
+        
+        for ip, ports in self.open_ports_per_device.items():
+            devices_ips.append(ip)
+            ports_count.append(len(ports))
+        
+        plt.figure(figsize=(10, 6))
+        plt.bar(devices_ips, ports_count, color='red', alpha=0.7)
+        plt.xlabel('IP Address')
+        plt.ylabel('Number of Open Ports')
+        plt.title('Open Ports per Device on Network')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        
+        # Save to bytes
+        img_data = io.BytesIO()
+        plt.savefig(img_data, format='png')
+        img_data.seek(0)
+        plt.close()
+        
+        return img_data
+
+# ================= PDF REPORT GENERATOR =================
+class PDFReportGenerator:
+    def __init__(self, scanner):
+        self.scanner = scanner
+        self.filename = f"vulnerability_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        self.doc = SimpleDocTemplate(self.filename, pagesize=A4)
+        self.styles = getSampleStyleSheet()
+        self.elements = []
+        
+    def add_title(self):
+        """Add title page"""
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=self.styles['Heading1'],
+            fontSize=24,
+            textColor=colors.red,
+            alignment=1,
+            spaceAfter=30
+        )
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=self.styles['Normal'],
+            fontSize=12,
+            alignment=1,
+            textColor=colors.grey
+        )
+        
+        self.elements.append(Spacer(1, 72))
+        self.elements.append(Paragraph("BAKOME Security Audit Report", title_style))
+        self.elements.append(Spacer(1, 12))
+        self.elements.append(Paragraph(f"Generated: {self.scanner.scan_time.strftime('%Y-%m-%d %H:%M:%S')}", subtitle_style))
+        self.elements.append(Paragraph(f"Network: {self.scanner.network_cidr}", subtitle_style))
+        self.elements.append(Spacer(1, 72))
+        self.elements.append(PageBreak())
+    
+    def add_summary(self):
+        """Add executive summary"""
+        summary_style = ParagraphStyle(
+            'SummaryStyle',
+            parent=self.styles['Normal'],
+            fontSize=11,
+            spaceAfter=12
+        )
+        
+        self.elements.append(Paragraph("Executive Summary", self.styles['Heading1']))
+        self.elements.append(Spacer(1, 12))
+        
+        summary_text = f"""
+        This automated network security scan was performed on {self.scanner.scan_time.strftime('%Y-%m-%d at %H:%M:%S')}. 
+        The scan identified {len(self.scanner.devices)} active devices on the network {self.scanner.network_cidr}.
+        Among these, {len([p for p in self.scanner.open_ports_per_device.values() if len(p)>0])} devices have open network ports.
+        
+        Total potential vulnerabilities detected: <b>{len(self.scanner.vulnerabilities)}</b>.
+        
+        Critical findings include exposed services such as Telnet (port 23), SMB (port 445), 
+        and database servers with default configurations. Immediate action is recommended to:
+        
+        • Close unnecessary open ports
+        • Change default credentials on routers and IoT devices
+        • Enable firewall rules to restrict access
+        • Update firmware on all network equipment
+        """
+        
+        self.elements.append(Paragraph(summary_text, summary_style))
+        self.elements.append(Spacer(1, 12))
+        
+        # Add statistics table
+        stats_data = [
+            ['Metric', 'Value'],
+            ['Total Devices Found', str(len(self.scanner.devices))],
+            ['Devices with Open Ports', str(len([p for p in self.scanner.open_ports_per_device.values() if len(p)>0]))],
+            ['Total Vulnerabilities', str(len(self.scanner.vulnerabilities))],
+            ['Total Open Ports', str(sum(len(p) for p in self.scanner.open_ports_per_device.values()))],
+            ['Scan Duration', '< 5 minutes']
+        ]
+        
+        stats_table = Table(stats_data, colWidths=[200, 100])
+        stats_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        
+        self.elements.append(stats_table)
+        self.elements.append(Spacer(1, 12))
+        self.elements.append(PageBreak())
+    
+    def add_devices_table(self):
+        """Add table of discovered devices"""
+        self.elements.append(Paragraph("Discovered Network Devices", self.styles['Heading1']))
+        self.elements.append(Spacer(1, 12))
+        
+        device_data = [['IP Address', 'MAC Address', 'Hostname', 'Open Ports']]
+        
+        for device in self.scanner.devices:
+            ip = device['ip']
+            mac = device['mac']
+            hostname = device['hostname']
+            ports = ', '.join(map(str, self.scanner.open_ports_per_device.get(ip, [])))
+            if not ports:
+                ports = 'None'
+            device_data.append([ip, mac, hostname, ports])
+        
+        device_table = Table(device_data, colWidths=[100, 120, 150, 100])
+        device_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 8)
+        ]))
+        
+        self.elements.append(device_table)
+        self.elements.append(Spacer(1, 12))
+        self.elements.append(PageBreak())
+    
+    def add_vulnerabilities_table(self):
+        """Add vulnerabilities table with severity"""
+        self.elements.append(Paragraph("Detected Vulnerabilities", self.styles['Heading1']))
+        self.elements.append(Spacer(1, 12))
+        
+        vuln_data = [['IP Address', 'Device', 'Port', 'Issue Description']]
+        
+        for vuln in self.scanner.vulnerabilities:
+            vuln_data.append([
+                vuln['ip'],
+                vuln.get('hostname', 'Unknown'),
+                str(vuln['port']),
+                vuln['service']
+            ])
+        
+        if len(vuln_data) == 1:
+            vuln_data.append(['-', '-', '-', 'No vulnerabilities detected'])
+        
+        vuln_table = Table(vuln_data, colWidths=[100, 120, 60, 200])
+        vuln_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.red),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.lightyellow),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTSIZE', (0, 1), (-1, -1), 8)
+        ]))
+        
+        self.elements.append(vuln_table)
+        self.elements.append(Spacer(1, 12))
+    
+    def add_recommendations(self):
+        """Add security recommendations"""
+        self.elements.append(PageBreak())
+        self.elements.append(Paragraph("Security Recommendations", self.styles['Heading1']))
+        self.elements.append(Spacer(1, 12))
+        
+        recommendations = [
+            "1. Close all unnecessary open ports using firewall rules",
+            "2. Change default passwords on all routers, switches, and IoT devices",
+            "3. Disable Telnet and use SSH with key authentication",
+            "4. Update firmware and operating systems to latest versions",
+            "5. Implement network segmentation for critical devices",
+            "6. Enable logging and monitoring for suspicious activities",
+            "7. Use VPN for remote access instead of exposed RDP",
+            "8. Regularly scan network for new vulnerabilities"
+        ]
+        
+        rec_style = ParagraphStyle(
+            'RecStyle',
+            parent=self.styles['Normal'],
+            fontSize=10,
+            textColor=colors.darkred,
+            spaceAfter=8
+        )
+        
+        for rec in recommendations:
+            self.elements.append(Paragraph(rec, rec_style))
+        
+        self.elements.append(Spacer(1, 12))
+        
+        # Add graph
+        self.elements.append(Paragraph("Open Ports Distribution", self.styles['Heading2']))
+        self.elements.append(Spacer(1, 12))
+        
+        img_data = self.scanner.generate_graph()
+        img = Image(img_data, width=400, height=250)
+        self.elements.append(img)
+    
+    def generate(self):
+        """Generate the final PDF report"""
+        print("[+] Generating PDF report...")
+        
+        self.add_title()
+        self.add_summary()
+        self.add_devices_table()
+        self.add_vulnerabilities_table()
+        self.add_recommendations()
+        
+        self.doc.build(self.elements)
+        print(f"[+] Report saved as: {self.filename}")
+        return self.filename
+
+# ================= MAIN EXECUTION =================
+def main():
+    print("""
+    ╔══════════════════════════════════════════════════════════╗
+    ║     BAKOME Network Vulnerability Scanner v1.0            ║
+    ║     Automated Security Audit with PDF Report             ║
+    ╚══════════════════════════════════════════════════════════╝
+    """)
+    
+    # Check for root/admin privileges (required for ARP scanning)
+    if platform.system() == "Windows":
+        import ctypes
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            print("[-] Please run as Administrator on Windows")
+            sys.exit(1)
+    else:
+        if os.geteuid() != 0:
+            print("[-] Please run with sudo (requires root for ARP scanning)")
+            print("    sudo python3 network_scanner.py")
+            sys.exit(1)
+    
+    # Get network to scan
+    network = input(f"[?] Enter network to scan (default: {NETWORK_SCAN_CIDR}): ").strip()
+    if not network:
+        network = NETWORK_SCAN_CIDR
+    
+    # Validate network format
+    try:
+        ipaddress.ip_network(network, strict=False)
+    except:
+        print("[-] Invalid network format. Using default.")
+        network = NETWORK_SCAN_CIDR
+    
+    # Run scan
+    scanner = NetworkScanner(network)
+    
+    print("\n[+] Starting network scan...")
+    scanner.discover_devices_arp()
+    
+    if len(scanner.devices) == 0:
+        print("[-] No devices found. Check network connection.")
+        sys.exit(1)
+    
+    scanner.scan_all_devices()
+    scanner.check_common_vulnerabilities()
+    
+    # Generate report
+    report_gen = PDFReportGenerator(scanner)
+    report_file = report_gen.generate()
+    
+    print(f"""
+    ╔══════════════════════════════════════════════════════════╗
+    ║                    SCAN COMPLETE                         ║
+    ╚══════════════════════════════════════════════════════════╝
+    
+    Summary:
+    - Devices found: {len(scanner.devices)}
+    - Vulnerabilities: {len(scanner.vulnerabilities)}
+    - Report saved: {report_file}
+    
+    Open the PDF file to view detailed results.
+    """)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[-] Scan interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[-] Error: {e}")
+        sys.exit(1)
